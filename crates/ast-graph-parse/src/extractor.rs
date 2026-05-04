@@ -182,7 +182,15 @@ pub fn extract_doc_comment_anchor(source: &[u8], node: &tree_sitter::Node) -> Op
     let parent = node.parent()?;
     if matches!(
         parent.kind(),
-        "type_declaration" | "decorated_definition" | "const_declaration" | "var_declaration"
+        "type_declaration"
+            | "decorated_definition"
+            | "const_declaration"
+            | "var_declaration"
+            // Ruby's class/module body: tree-sitter-ruby attaches the leading
+            // comment of the first statement to the enclosing class/module
+            // node, not to the body_statement wrapper. Walk up so we still
+            // find it.
+            | "body_statement"
     ) {
         extract_preceding_doc_comment(source, &parent)
     } else {

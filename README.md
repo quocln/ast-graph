@@ -12,7 +12,7 @@ ast-graph hotspots
 
 ## Features
 
-- **Multi-language** — Rust, Python, JavaScript/TypeScript, C# (.NET), Java, Go
+- **Multi-language** — Rust, Python, JavaScript/TypeScript, C# (.NET), Java, Go, Ruby, PHP, Swift
 - **AST compression** — strips full syntax trees down to structural nodes only (~90% reduction)
 - **Class-context-aware resolution** — `this.method()` / `self.method()` calls resolve to the correct class, not every method with that name across the codebase
 - **Cross-file resolution** — resolves function calls, imports, type references, inheritance across files
@@ -429,7 +429,7 @@ FalkorDB stores the same data as a property graph. Every symbol is a `:Symbol` n
 | `line_start` / `line_end` | int | definition range |
 | `signature` / `doc_comment` | string? | `doc_comment` populated by default from preceding `///`, `/** */`, JSDoc, JavaDoc, or Python docstrings; null when source has no doc or `--no-doc-comments` was used |
 | `visibility` | string | `Public`, `Private`, `Protected`, `Internal` |
-| `language` | string | `rust`, `python`, `javascript`, `typescript`, `csharp`, `java`, `go` |
+| `language` | string | `rust`, `python`, `javascript`, `typescript`, `csharp`, `java`, `go`, `ruby`, `php`, `swift` |
 
 Relationship types: `CALLS`, `CONTAINS`, `IMPORTS`, `EXTENDS`, `IMPLEMENTS`, `REFERENCES`, `OVERRIDES`. Every relationship carries a `line` property — **the source line where the relationship originates** (call site for `CALLS`, not the callee's definition line). `line` is `0` when no meaningful line exists (mostly structural `CONTAINS`).
 
@@ -443,6 +443,9 @@ Relationship types: `CALLS`, `CONTAINS`, `IMPORTS`, `EXTENDS`, `IMPLEMENTS`, `RE
 | **C# (.NET)** | `.cs` | class, method, constructor, interface, using, namespace, record, enum |
 | **Java** | `.java` | class, interface, enum, record, method, constructor, field, import, package, extends, implements |
 | **Go** | `.go` | package, func, method (pointer + value receivers), struct, interface, type alias, import, const, field |
+| **Ruby** | `.rb` | module, class (with superclass), method, singleton method (`def self.x`), constructor (`initialize`), constant, `require` / `require_relative` / `load`, full visibility (`private`/`protected`/`public` toggles + `private :foo` targeted form). **Rails-aware**: `has_many`/`has_one`/`belongs_to`/`has_and_belongs_to_many` (synthetic Property + REFERENCES via `Inflector` + supplementary irregular plurals, `class_name:` override honored), `attr_accessor`/`attr_reader`/`attr_writer`, `before_*`/`after_*`/`around_*` callbacks, `validates`/`validate`, `delegate :x, to:`, `scope :name`, AR `enum status: { ... }` (synthetic predicate `?`/bang `!` methods), `helper_method`, ActionCable `identified_by`, `include`/`extend`/`prepend` (IMPLEMENTS), and `config/routes.rb` parsing (`resources` / `resource` with `only:` / `except:` / `controller:` overrides, HTTP verbs in arrow + `to:` forms, `namespace`/`scope` nesting, `member`/`collection` blocks, `root`) — emits CALLS edges from a synthetic `Routes` node to controller actions |
+| **PHP** | `.php`, `.phtml` | namespace (fully-qualified symbol names), class, interface, trait, enum + cases, function, method, constructor (`__construct`), property, class constant, `use` declarations (incl. grouped `use Foo\{A, B}`), `extends` / `implements`, full visibility (`public`/`protected`/`private`) |
+| **Swift** | `.swift` | `import`, class / struct / actor / enum, protocol (→ Interface), extension (methods qualified to extended type), `func`, `init` (Constructor), property, enum case, typealias, full visibility (`open`/`public`/`internal`/`fileprivate`/`private` mapped to 4-level enum) |
 
 ## Edge Types
 
