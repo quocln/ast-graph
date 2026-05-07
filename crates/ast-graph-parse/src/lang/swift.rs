@@ -66,7 +66,7 @@ fn walk_top(
                 extract_function(source, &child, file_path, parent_id, None, symbols, raw_edges);
             }
             "property_declaration" => {
-                extract_property(source, &child, file_path, parent_id, None, symbols);
+                extract_property(source, &child, file_path, parent_id, None, symbols, raw_edges);
             }
             "typealias_declaration" => {
                 extract_typealias(source, &child, file_path, parent_id, symbols);
@@ -271,7 +271,10 @@ fn walk_type_body(
                 extract_init(source, &child, file_path, parent_id, container_name, symbols, raw_edges);
             }
             "property_declaration" | "protocol_property_declaration" => {
-                extract_property(source, &child, file_path, parent_id, Some(container_name), symbols);
+                extract_property(source, &child, file_path, parent_id, Some(container_name), symbols, raw_edges);
+            }
+            "subscript_declaration" => {
+                extract_subscript(source, &child, file_path, parent_id, container_name, symbols, raw_edges);
             }
             "class_declaration" => {
                 // Nested type — recurse.
@@ -338,7 +341,9 @@ fn extract_function(
     });
 
     if let Some(body) = child_by_field(node, "body") {
-        extract_calls(source, &body, id, container_name, raw_edges);
+        // Collect generic type parameters to annotate call targets for disambiguation.
+        let generic_params = collect_generic_params(source, node);
+        extract_calls_with_generics(source, &body, id, container_name, &generic_params, raw_edges);
     }
 }
 
@@ -386,6 +391,7 @@ fn extract_property(
     parent_id: NodeId,
     container_name: Option<&str>,
     symbols: &mut Vec<SymbolNode>,
+    raw_edges: &mut Vec<RawEdge>,
 ) {
     let visibility = read_visibility(source, node);
     let name_node = match child_by_field(node, "name") {
@@ -410,6 +416,12 @@ fn extract_property(
         None => bare.clone(),
     };
 
+    // Detect computed property: property_declaration with a computed_property child
+    // that contains getter/setter blocks or is a bare shorthand getter.
+    let is_computed = find_child_by_kind(node, "computed_property").is_some();
+
+    let sig_prefix = if is_computed { "computed var" } else { "var" };
+
     let id = NodeId::new(
         &file_path.to_string_lossy(),
         &qualified,
@@ -423,12 +435,52 @@ fn extract_property(
         kind: SymbolKind::Property,
         file_path: file_path.to_path_buf(),
         line_range: (node.start_position().row as u32, node.end_position().row as u32),
-        signature: Some(bare),
+        signature: Some(format!("{sig_prefix} {bare}")),
         doc_comment: extract_preceding_doc_comment(source, node),
         visibility,
         language: Language::Swift,
         parent: Some(parent_id),
     });
+
+    // For computed properties, extract CALLS edges from getter and setter bodies.
+    if is_computed {
+        if let Some(computed) = find_child_by_kind(node, "computed_property") {
+            extract_calls_from_computed_property(source, &computed, id, container_name, raw_edges);
+        }
+    }
+}
+
+/// Walk a `computed_property` node and extract CALLS from getter/setter statement blocks.
+/// Handles two shapes:
+///   - `var foo { <statements> }` — shorthand getter (statements directly in computed_property)
+///   - `var foo { get { ... } set { ... } }` — explicit getter/setter via computed_getter/computed_setter
+fn extract_calls_from_computed_property(
+    source: &[u8],
+    computed: &tree_sitter::Node,
+    caller_id: NodeId,
+    container_name: Option<&str>,
+    raw_edges: &mut Vec<RawEdge>,
+) {
+    let mut cursor = computed.walk();
+    let mut has_explicit_accessor = false;
+    for child in computed.children(&mut cursor) {
+        match child.kind() {
+            "computed_getter" | "computed_setter" => {
+                has_explicit_accessor = true;
+                // Body is the statements node inside the accessor block.
+                if let Some(stmts) = find_child_by_kind(&child, "statements") {
+                    extract_calls(source, &stmts, caller_id, container_name, raw_edges);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Shorthand getter: no explicit accessor nodes — statements live directly in computed_property.
+    if !has_explicit_accessor {
+        if let Some(stmts) = find_child_by_kind(computed, "statements") {
+            extract_calls(source, &stmts, caller_id, container_name, raw_edges);
+        }
+    }
 }
 
 fn extract_enum_entry(
@@ -463,6 +515,60 @@ fn extract_enum_entry(
         language: Language::Swift,
         parent: Some(parent_id),
     });
+}
+
+/// `subscript_declaration` — emits as Method with the special name `__subscript`
+/// qualified to the enclosing type, e.g. `Array.__subscript`.
+/// Parameters are `parameter` children of the subscript node (before the return type).
+fn extract_subscript(
+    source: &[u8],
+    node: &tree_sitter::Node,
+    file_path: &Path,
+    parent_id: NodeId,
+    container_name: &str,
+    symbols: &mut Vec<SymbolNode>,
+    raw_edges: &mut Vec<RawEdge>,
+) {
+    let visibility = read_visibility(source, node);
+    let qualified = format!("{container_name}.__subscript");
+
+    // Collect parameter labels for the signature string.
+    let mut params: Vec<String> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "parameter" {
+            params.push(node_text(source, &child).to_string());
+        }
+    }
+
+    let return_type = child_by_field(node, "return_type")
+        .map(|r| format!(" -> {}", node_text(source, &r)))
+        .unwrap_or_default();
+
+    let id = NodeId::new(
+        &file_path.to_string_lossy(),
+        &qualified,
+        SymbolKind::Method,
+        node.start_position().row as u32,
+    );
+
+    symbols.push(SymbolNode {
+        id,
+        name: qualified,
+        kind: SymbolKind::Method,
+        file_path: file_path.to_path_buf(),
+        line_range: (node.start_position().row as u32, node.end_position().row as u32),
+        signature: Some(format!("subscript({}){}", params.join(", "), return_type)),
+        doc_comment: extract_preceding_doc_comment(source, node),
+        visibility,
+        language: Language::Swift,
+        parent: Some(parent_id),
+    });
+
+    // Extract CALLS from the subscript body (a computed_property node).
+    if let Some(body) = find_child_by_kind(node, "computed_property") {
+        extract_calls_from_computed_property(source, &body, id, Some(container_name), raw_edges);
+    }
 }
 
 fn extract_typealias(
@@ -585,6 +691,8 @@ fn emit_inheritance(
 ///   - `navigation_expression(...)` → method-style call, target = "Recv.name"
 /// `self.method` and bare `method` inside a type body get qualified to
 /// `Container.method`.
+/// `generic_params`: type parameter names from the enclosing function's
+/// `type_parameters` clause, used to annotate call targets for resolver disambiguation.
 fn extract_calls(
     source: &[u8],
     node: &tree_sitter::Node,
@@ -592,10 +700,21 @@ fn extract_calls(
     container_name: Option<&str>,
     raw_edges: &mut Vec<RawEdge>,
 ) {
+    extract_calls_with_generics(source, node, caller_id, container_name, &[], raw_edges);
+}
+
+fn extract_calls_with_generics(
+    source: &[u8],
+    node: &tree_sitter::Node,
+    caller_id: NodeId,
+    container_name: Option<&str>,
+    generic_params: &[String],
+    raw_edges: &mut Vec<RawEdge>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
-            if let Some(target) = build_call_target(source, &child, container_name) {
+            if let Some(target) = build_call_target(source, &child, container_name, generic_params) {
                 raw_edges.push(RawEdge {
                     source: caller_id,
                     kind: EdgeKind::Calls,
@@ -605,14 +724,36 @@ fn extract_calls(
                 });
             }
         }
-        extract_calls(source, &child, caller_id, container_name, raw_edges);
+        extract_calls_with_generics(source, &child, caller_id, container_name, generic_params, raw_edges);
     }
+}
+
+/// Collect type parameter names from a `type_parameters` node on a function declaration.
+/// E.g. `<T: Comparable, U>` → ["T", "U"]
+fn collect_generic_params(source: &[u8], func_node: &tree_sitter::Node) -> Vec<String> {
+    let type_params = match find_child_by_kind(func_node, "type_parameters") {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut names = Vec::new();
+    let mut cursor = type_params.walk();
+    for child in type_params.children(&mut cursor) {
+        if child.kind() == "type_parameter" {
+            // The first named child is the type identifier (the param name).
+            // Use find_child_by_kind to avoid cursor lifetime issues.
+            if let Some(name_node) = find_child_by_kind(&child, "type_identifier") {
+                names.push(node_text(source, &name_node).to_string());
+            }
+        }
+    }
+    names
 }
 
 fn build_call_target(
     source: &[u8],
     call: &tree_sitter::Node,
     container_name: Option<&str>,
+    generic_params: &[String],
 ) -> Option<String> {
     // The callable is the first named child of call_expression that isn't a
     // call_suffix (call_suffix is the trailing parenthesized argument list).
@@ -643,6 +784,18 @@ fn build_call_target(
             if target_text == "self" {
                 if let Some(cn) = container_name {
                     return Some(format!("{cn}.{method}"));
+                }
+            }
+            // Annotate receiver with generic context when the receiver text
+            // is a simple identifier that shares a name with a type parameter,
+            // helping the resolver disambiguate calls on generic types.
+            // E.g. `func f<T>(_ t: T) { t.doThing() }` → "T.doThing" instead of "t.doThing".
+            if !generic_params.is_empty() {
+                // Check if any generic param name appears in or equals the receiver text.
+                // For `[T]`-typed receivers the receiver text is the variable name (e.g. `xs`),
+                // so we can only annotate when the receiver IS a type param name itself.
+                if generic_params.iter().any(|p| p == target_text) {
+                    return Some(format!("{target_text}<{}>.{method}", generic_params.join(", ")));
                 }
             }
             Some(format!("{target_text}.{method}"))
@@ -906,4 +1059,5 @@ extension User: Greeter {
             e.kind == EdgeKind::Imports && e.target_name == "Foundation"
         ));
     }
+
 }

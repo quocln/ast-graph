@@ -210,6 +210,8 @@ pub fn extract_routes(
                 }
             }
         }
+        // No HTTP-route pattern wired up yet for these languages.
+        Language::Ruby | Language::Php | Language::Swift => {}
     }
 }
 
