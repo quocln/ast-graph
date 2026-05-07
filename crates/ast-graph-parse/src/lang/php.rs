@@ -104,7 +104,12 @@ fn walk_top(
             "compound_statement" => {
                 walk_top(source, &child, file_path, parent_id, current_ns.as_deref(), symbols, raw_edges);
             }
-            _ => {}
+            // Scan any other statement for inline arrow functions / anonymous classes
+            // (`$f = fn($x) => ...;`, `$x = new class { ... };`).  extract_calls
+            // handles both node types recursively; container_qualified=None at file scope.
+            _ => {
+                extract_calls(source, &child, parent_id, None, file_path, symbols, raw_edges);
+            }
         }
     }
 }
@@ -461,7 +466,7 @@ fn extract_method(
     });
 
     if let Some(body) = child_by_field(node, "body") {
-        extract_calls(source, &body, id, Some(container_qualified), raw_edges);
+        extract_calls(source, &body, id, Some(container_qualified), file_path, symbols, raw_edges);
     }
 }
 
@@ -510,7 +515,7 @@ fn extract_function(
     });
 
     if let Some(body) = child_by_field(node, "body") {
-        extract_calls(source, &body, id, None, raw_edges);
+        extract_calls(source, &body, id, None, file_path, symbols, raw_edges);
     }
 }
 
@@ -712,19 +717,25 @@ fn qualify_with_ns(name: &str, namespace: Option<&str>) -> String {
     }
 }
 
-/// Walk a function/method body collecting CALLS edges. Handles the three
-/// PHP call shapes:
-///   - function_call_expression:  `foo()`
-///   - member_call_expression:    `$obj->method()`
-///   - scoped_call_expression:    `Class::method()` / `static::method()` / `self::method()`
+/// Walk a body tree collecting CALLS/REFERENCES edges and emitting inline symbols.
 ///
-/// For `$this->method()` and `self::method()` / `static::method()`, qualifies
-/// the call to the enclosing fully-qualified container.
+/// Handles the three PHP call shapes (function_call_expression, member_call_expression,
+/// scoped_call_expression). `$this`/`self`/`static` calls are qualified to the
+/// enclosing container.
+///
+/// PHP 8.1 first-class callable syntax (`strlen(...)`) is detected when arguments
+/// contain only `variadic_placeholder` — emits REFERENCES instead of CALLS.
+///
+/// PHP 7.4+ arrow functions (`arrow_function` node) and anonymous classes
+/// (`object_creation_expression` wrapping `anonymous_class`) emit symbols inline
+/// and recurse into their bodies.
 fn extract_calls(
     source: &[u8],
     node: &tree_sitter::Node,
     caller_id: NodeId,
     container_qualified: Option<&str>,
+    file_path: &Path,
+    symbols: &mut Vec<SymbolNode>,
     raw_edges: &mut Vec<RawEdge>,
 ) {
     let mut cursor = node.walk();
@@ -732,10 +743,16 @@ fn extract_calls(
         match child.kind() {
             "function_call_expression" => {
                 if let Some(f) = child_by_field(&child, "function") {
+                    let target_name = node_text(source, &f).to_string();
+                    let edge_kind = if args_are_callable_syntax(source, &child) {
+                        EdgeKind::References
+                    } else {
+                        EdgeKind::Calls
+                    };
                     raw_edges.push(RawEdge {
                         source: caller_id,
-                        kind: EdgeKind::Calls,
-                        target_name: node_text(source, &f).to_string(),
+                        kind: edge_kind,
+                        target_name,
                         target_module: None,
                         source_line: child.start_position().row as u32,
                     });
@@ -756,9 +773,14 @@ fn extract_calls(
                     } else {
                         format!("{obj_text}.{method}")
                     };
+                    let edge_kind = if args_are_callable_syntax(source, &child) {
+                        EdgeKind::References
+                    } else {
+                        EdgeKind::Calls
+                    };
                     raw_edges.push(RawEdge {
                         source: caller_id,
-                        kind: EdgeKind::Calls,
+                        kind: edge_kind,
                         target_name: target,
                         target_module: None,
                         source_line: child.start_position().row as u32,
@@ -780,18 +802,153 @@ fn extract_calls(
                     } else {
                         format!("{scope_text}.{method}")
                     };
+                    let edge_kind = if args_are_callable_syntax(source, &child) {
+                        EdgeKind::References
+                    } else {
+                        EdgeKind::Calls
+                    };
                     raw_edges.push(RawEdge {
                         source: caller_id,
-                        kind: EdgeKind::Calls,
+                        kind: edge_kind,
                         target_name: target,
                         target_module: None,
                         source_line: child.start_position().row as u32,
                     });
                 }
             }
+            "arrow_function" => {
+                extract_arrow_function(
+                    source, &child, file_path, caller_id, container_qualified,
+                    symbols, raw_edges,
+                );
+                continue; // extract_arrow_function handles the body
+            }
+            "object_creation_expression" => {
+                if let Some(anon) = find_child_by_kind(&child, "anonymous_class") {
+                    extract_anonymous_class(
+                        source, &anon, file_path, caller_id,
+                        symbols, raw_edges,
+                    );
+                }
+                extract_calls(source, &child, caller_id, container_qualified, file_path, symbols, raw_edges);
+                continue;
+            }
             _ => {}
         }
-        extract_calls(source, &child, caller_id, container_qualified, raw_edges);
+        extract_calls(source, &child, caller_id, container_qualified, file_path, symbols, raw_edges);
+    }
+}
+
+/// Returns `true` when arguments contain only `variadic_placeholder` (`...`) —
+/// the PHP 8.1 first-class callable syntax (`strlen(...)`).
+fn args_are_callable_syntax(_source: &[u8], call_node: &tree_sitter::Node) -> bool {
+    let args = match child_by_field(call_node, "arguments") {
+        Some(a) => a,
+        None => return false,
+    };
+    let mut cursor = args.walk();
+    let named_children: Vec<_> = args.children(&mut cursor).filter(|n| n.is_named()).collect();
+    // Must be exactly one named child and that child is `variadic_placeholder`.
+    named_children.len() == 1 && named_children[0].kind() == "variadic_placeholder"
+}
+
+/// Extract a PHP 7.4+ arrow function (`arrow_function` node).
+/// Emits a Function symbol `__arrow_<basename>_L<line>`; recurses into body for call edges.
+fn extract_arrow_function(
+    source: &[u8],
+    node: &tree_sitter::Node,
+    file_path: &Path,
+    parent_id: NodeId,
+    container_qualified: Option<&str>,
+    symbols: &mut Vec<SymbolNode>,
+    raw_edges: &mut Vec<RawEdge>,
+) {
+    let line = node.start_position().row as u32;
+    let basename = file_path.file_stem().unwrap_or_default().to_string_lossy();
+    let synthetic_name = format!("__arrow_{basename}_L{line}");
+
+    let params = child_by_field(node, "parameters")
+        .map(|p| node_text(source, &p).to_string())
+        .unwrap_or_else(|| "()".to_string());
+
+    let id = NodeId::new(
+        &file_path.to_string_lossy(),
+        &synthetic_name,
+        SymbolKind::Function,
+        line,
+    );
+
+    symbols.push(SymbolNode {
+        id,
+        name: synthetic_name,
+        kind: SymbolKind::Function,
+        file_path: file_path.to_path_buf(),
+        line_range: (line, node.end_position().row as u32),
+        signature: Some(format!("fn{params} =>")),
+        doc_comment: None,
+        visibility: Visibility::Public,
+        language: Language::Php,
+        parent: Some(parent_id),
+    });
+
+    // Body is the named non-formal_parameters child that follows `=>`.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() && child.kind() != "formal_parameters" {
+            extract_calls(source, &child, id, container_qualified, file_path, symbols, raw_edges);
+        }
+    }
+}
+
+/// Extract an anonymous class (`anonymous_class` inside `object_creation_expression`).
+/// Emits a Class symbol `__AnonClass_<basename>_L<line>` with extends/implements edges.
+fn extract_anonymous_class(
+    source: &[u8],
+    node: &tree_sitter::Node,   // the `anonymous_class` node
+    file_path: &Path,
+    parent_id: NodeId,
+    symbols: &mut Vec<SymbolNode>,
+    raw_edges: &mut Vec<RawEdge>,
+) {
+    let line = node.start_position().row as u32;
+    let basename = file_path.file_stem().unwrap_or_default().to_string_lossy();
+    let synthetic_name = format!("__AnonClass_{basename}_L{line}");
+
+    let id = NodeId::new(
+        &file_path.to_string_lossy(),
+        &synthetic_name,
+        SymbolKind::Class,
+        line,
+    );
+
+    symbols.push(SymbolNode {
+        id,
+        name: synthetic_name.clone(),
+        kind: SymbolKind::Class,
+        file_path: file_path.to_path_buf(),
+        line_range: (line, node.end_position().row as u32),
+        signature: Some("new class".to_string()),
+        doc_comment: None,
+        visibility: Visibility::Public,
+        language: Language::Php,
+        parent: Some(parent_id),
+    });
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "base_clause" => {
+                emit_inheritance_edges(source, &child, id, EdgeKind::Extends, raw_edges);
+            }
+            "class_interface_clause" => {
+                emit_inheritance_edges(source, &child, id, EdgeKind::Implements, raw_edges);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(body) = find_child_by_kind(node, "declaration_list") {
+        walk_class_body(source, &body, file_path, id, &synthetic_name, symbols, raw_edges);
     }
 }
 
@@ -1007,6 +1164,90 @@ mod tests {
         let c = find(&syms, "Foo").unwrap();
         let doc = c.doc_comment.as_deref().unwrap_or("");
         assert!(doc.contains("A foo widget."), "doc was: {doc:?}");
+    }
+
+    // ── New feature tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn arrow_function_symbol_and_call_edges() {
+        // Symbol emitted with __arrow_ prefix and _L line marker.
+        let src1 = "<?php\n$f = fn($x) => $x * 2;\n";
+        let (syms1, _) = extract(src1);
+        let arrow = syms1.iter().find(|s| s.name.starts_with("__arrow_"))
+            .expect("expected __arrow_ symbol");
+        assert_eq!(arrow.kind, SymbolKind::Function);
+        assert!(arrow.name.contains("_L"), "name missing _L: {}", arrow.name);
+
+        // Outer function still sees array_map as a CALLS edge when arrow fn is an arg.
+        let src2 = "<?php\nfunction outer() {\n  $xs = array_map(fn($x) => $x * 2, $arr);\n}\n";
+        let (syms2, edges2) = extract(src2);
+        let outer = syms2.iter().find(|s| s.name == "outer").expect("outer missing");
+        let calls: Vec<_> = edges2.iter()
+            .filter(|e| e.source == outer.id && e.kind == EdgeKind::Calls)
+            .map(|e| e.target_name.as_str()).collect();
+        assert!(calls.contains(&"array_map"), "got: {calls:?}");
+    }
+
+    #[test]
+    fn anonymous_class_symbol_edges_and_methods() {
+        let src = "<?php\n$x = new class extends Base implements I { public function foo() {} };\n";
+        let (syms, edges) = extract(src);
+        let anon = syms.iter().find(|s| s.name.starts_with("__AnonClass_"))
+            .expect("__AnonClass_ missing");
+        assert_eq!(anon.kind, SymbolKind::Class);
+        assert!(edges.iter().any(|e|
+            e.source == anon.id && e.kind == EdgeKind::Extends && e.target_name == "Base"
+        ), "expected Extends edge to Base");
+        assert!(edges.iter().any(|e|
+            e.source == anon.id && e.kind == EdgeKind::Implements && e.target_name == "I"
+        ), "expected Implements edge to I");
+        // Method inside the anonymous class is qualified to it.
+        assert!(syms.iter().any(|s| s.name.contains(".foo") && s.kind == SymbolKind::Method),
+            "expected .foo method, got: {:?}", syms.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn first_class_callable_bare_function_emits_references() {
+        // `strlen(...)` — first-class callable, not an invocation.
+        let src = "<?php\nfunction outer() { $f = strlen(...); }\n";
+        let (syms, edges) = extract(src);
+        let outer = syms.iter().find(|s| s.name == "outer").expect("outer missing");
+        let refs: Vec<_> = edges.iter()
+            .filter(|e| e.source == outer.id && e.kind == EdgeKind::References)
+            .map(|e| e.target_name.as_str())
+            .collect();
+        assert!(refs.contains(&"strlen"), "expected References edge to strlen, got: {refs:?}");
+        // Must NOT emit a Calls edge for this
+        let calls: Vec<_> = edges.iter()
+            .filter(|e| e.source == outer.id && e.kind == EdgeKind::Calls && e.target_name == "strlen")
+            .collect();
+        assert!(calls.is_empty(), "should not have Calls edge to strlen, got: {calls:?}");
+    }
+
+    #[test]
+    fn first_class_callable_method_emits_references() {
+        // `$this->method(...)` — first-class callable reference.
+        let src = "<?php\nclass Foo {\n  public function bar() { $f = $this->method(...); }\n  public function method() {}\n}\n";
+        let (syms, edges) = extract(src);
+        let bar = syms.iter().find(|s| s.name == "Foo.bar").expect("Foo.bar missing");
+        let refs: Vec<_> = edges.iter()
+            .filter(|e| e.source == bar.id && e.kind == EdgeKind::References)
+            .map(|e| e.target_name.as_str())
+            .collect();
+        assert!(refs.contains(&"Foo.method"), "expected References edge to Foo.method, got: {refs:?}");
+    }
+
+    #[test]
+    fn regular_call_is_not_references() {
+        // `strlen($x)` is a regular call — must stay as Calls, not References.
+        let src = "<?php\nfunction outer() { $n = strlen($x); }\n";
+        let (syms, edges) = extract(src);
+        let outer = syms.iter().find(|s| s.name == "outer").expect("outer missing");
+        let calls: Vec<_> = edges.iter()
+            .filter(|e| e.source == outer.id && e.kind == EdgeKind::Calls)
+            .map(|e| e.target_name.as_str())
+            .collect();
+        assert!(calls.contains(&"strlen"), "expected Calls edge to strlen, got: {calls:?}");
     }
 
     #[test]

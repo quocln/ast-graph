@@ -1,6 +1,6 @@
 use ast_graph_core::*;
 use crate::extractor::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub struct RubyExtractor;
@@ -207,6 +207,7 @@ fn walk_class_or_module_body(
     // Track inserted method symbol indices by name, so targeted overrides
     // can rewrite their visibility once we hit them.
     let mut method_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut seen_ivars: HashSet<String> = HashSet::new(); // dedup @ivar/@@cvar per class
 
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
@@ -220,10 +221,23 @@ fn walk_class_or_module_body(
                 if let Some(n) = method_name {
                     method_indices.entry(n).or_default().push(idx);
                 }
+                if let Some(method_body) = child_by_field(&child, "body") {
+                    extract_ivar_assignments(
+                        source, &method_body, file_path, parent_id,
+                        container_name, &mut seen_ivars, symbols,
+                    );
+                }
             }
             "singleton_method" => {
                 extract_singleton_method(
                     source, &child, file_path, parent_id, Some(container_name),
+                    symbols, raw_edges,
+                );
+            }
+            "singleton_class" => {
+                // `class << self ... end` — methods inside qualify to container.
+                extract_singleton_class(
+                    source, &child, file_path, parent_id, container_name,
                     symbols, raw_edges,
                 );
             }
@@ -466,6 +480,92 @@ fn extract_singleton_method(
 
     if let Some(body) = child_by_field(node, "body") {
         extract_calls(source, &body, id, container_name, raw_edges);
+    }
+}
+
+/// Handle a `class << self ... end` block.  Methods inside qualify to
+/// `container_name` (mirrors `def self.method` behaviour).
+/// `value` field = receiver (`self` or explicit object); `body` = body_statement.
+fn extract_singleton_class(
+    source: &[u8],
+    node: &tree_sitter::Node,
+    file_path: &Path,
+    parent_id: NodeId,
+    container_name: &str,
+    symbols: &mut Vec<SymbolNode>,
+    raw_edges: &mut Vec<RawEdge>,
+) {
+    // `class << self` → container; `class << SomeClass` → that name.
+    let qualifier = match child_by_field(node, "value") {
+        Some(v) => {
+            let text = node_text(source, &v);
+            if text == "self" { container_name.to_string() } else { text.to_string() }
+        }
+        None => container_name.to_string(),
+    };
+    let body = match child_by_field(node, "body") {
+        Some(b) => b,
+        None => return,
+    };
+    // Extract `def` methods as class-level, always Public (mirrors def self.x).
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "method" {
+            extract_instance_method(
+                source, &child, file_path, parent_id, Some(&qualifier),
+                Visibility::Public, symbols, raw_edges,
+            );
+        }
+    }
+}
+
+/// Scan a method body for `@foo` / `@@bar` assignments and emit Property
+/// symbols qualified to the enclosing class.  Deduplicates via `seen` so
+/// each ivar appears once per class regardless of how many methods assign it.
+fn extract_ivar_assignments(
+    source: &[u8],
+    node: &tree_sitter::Node,
+    file_path: &Path,
+    parent_id: NodeId,
+    container_name: &str,
+    seen: &mut HashSet<String>,
+    symbols: &mut Vec<SymbolNode>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "assignment" {
+            if let Some(lhs) = child_by_field(&child, "left") {
+                match lhs.kind() {
+                    "instance_variable" | "class_variable" => {
+                        let raw = node_text(source, &lhs); // "@name" or "@@count"
+                        if seen.insert(raw.to_string()) {
+                            let qualified = format!("{container_name}.{raw}");
+                            let line = child.start_position().row as u32;
+                            let id = NodeId::new(
+                                &file_path.to_string_lossy(),
+                                &qualified,
+                                SymbolKind::Property,
+                                line,
+                            );
+                            symbols.push(SymbolNode {
+                                id,
+                                name: qualified,
+                                kind: SymbolKind::Property,
+                                file_path: file_path.to_path_buf(),
+                                line_range: (line, child.end_position().row as u32),
+                                signature: Some(raw.to_string()),
+                                doc_comment: None,
+                                visibility: Visibility::Private,
+                                language: Language::Ruby,
+                                parent: Some(parent_id),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        extract_ivar_assignments(source, &child, file_path, parent_id, container_name, seen, symbols);
     }
 }
 
@@ -890,6 +990,59 @@ mod tests {
         let doc = m.doc_comment.as_deref().unwrap_or("");
         assert!(doc.contains("Bark loudly."), "doc was: {doc:?}");
         assert!(doc.contains("Returns a string."), "doc was: {doc:?}");
+    }
+
+
+    // ── instance/class variable tracking ────────────────────────────────────
+
+    #[test]
+    fn ivar_and_cvar_assignment_emit_property_symbols() {
+        // @name (instance var) and @@count (class var) both become Property symbols.
+        let src = "class User\n  def initialize\n    @name = \"\"\n    @@count = 0\n  end\nend\n";
+        let (syms, _) = extract(src);
+        let ivar = find(&syms, "User.@name").expect("User.@name missing");
+        assert_eq!(ivar.kind, SymbolKind::Property);
+        assert_eq!(ivar.visibility, Visibility::Private);
+        let cvar = find(&syms, "User.@@count").expect("User.@@count missing");
+        assert_eq!(cvar.kind, SymbolKind::Property);
+    }
+
+    #[test]
+    fn ivar_deduplication_across_methods() {
+        // @name assigned in both initialize and update — should only appear once.
+        let src = "class User\n  def initialize(name)\n    @name = name\n  end\n  def update(name)\n    @name = name\n  end\nend\n";
+        let (syms, _) = extract(src);
+        let ivar_count = syms.iter().filter(|s| s.name == "User.@name").count();
+        assert_eq!(ivar_count, 1, "User.@name should appear exactly once, got {ivar_count}");
+    }
+
+    #[test]
+    fn multiple_ivars_all_emitted() {
+        let src = "class User\n  def initialize\n    @name = \"\"\n    @email = \"\"\n    @age = 0\n  end\nend\n";
+        let (syms, _) = extract(src);
+        assert!(find(&syms, "User.@name").is_some(), "User.@name missing");
+        assert!(find(&syms, "User.@email").is_some(), "User.@email missing");
+        assert!(find(&syms, "User.@age").is_some(), "User.@age missing");
+    }
+
+    // ── singleton_class (class << self) support ──────────────────────────────
+
+    #[test]
+    fn singleton_class_methods_qualify_to_container() {
+        let src = "class Foo\n  class << self\n    def bar\n    end\n  end\nend\n";
+        let (syms, _) = extract(src);
+        let m = find(&syms, "Foo.bar").expect("Foo.bar from singleton_class missing");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn singleton_class_multiple_methods_and_coexists_with_def_self() {
+        let src = "class Foo\n  def self.factory\n  end\n  class << self\n    def create(attrs)\n    end\n    def find(id)\n    end\n  end\nend\n";
+        let (syms, _) = extract(src);
+        assert!(find(&syms, "Foo.factory").is_some(), "Foo.factory (def self.x) missing");
+        assert!(find(&syms, "Foo.create").is_some(), "Foo.create (class << self) missing");
+        assert!(find(&syms, "Foo.find").is_some(), "Foo.find (class << self) missing");
     }
 
     // ── full-file smoke test ─────────────────────────────────────────────────
